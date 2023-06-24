@@ -40,7 +40,7 @@ n_embd = 384
 dropout = 0.0  # for pretraining 0 is good, for finetuning try 0.1+
 bias = False  # do we use bias inside LayerNorm and Linear layers?
 # optimizer
-optimizer_name = "sophiag"
+optimizer_name = "sophiah"
 learning_rate = 3e-4  # max learning rate
 max_iters = 600000  # total number of training iterations
 weight_decay = 1e-1
@@ -60,7 +60,7 @@ min_lr = 1.5e-5  # minimum learning rate, should be ~= learning_rate/10 per Chin
 backend = "nccl"  # 'nccl', 'gloo', etc.
 # system
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = "float32"
+dtype = "float16"
 # set complile to True if OS isn't Windows
 compile = True if platform.system() != "Windows" else False
 scale_attn_by_inverse_layer_idx = False
@@ -263,11 +263,9 @@ t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
-num_param = 1
-num_effective = 0
 momentum_norm = 0
-hessian_norm = 0
-hessian_norm2 = 0
+hessian_squared_norm = 0
+hessian_squared_norm2 = 0
 clip_time = 0
 while True:
     # determine and set the learning rate for this iteration
@@ -325,7 +323,7 @@ while True:
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = get_batch("train")
             # backward pass, with gradient scaling if training in fp16
-            (loss).backward()
+            (loss).backward(create_graph=True)
         # clip the gradient
         if grad_clip != 0.0:
             total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -374,9 +372,8 @@ while True:
                         "lr": lr,
                         "param_norm": total_param_norm,
                         "momentum_norm": momentum_norm,
-                        "hessian_norm": hessian_norm,
-                        "hessian_norm2": hessian_norm2,
-                        "train/win_rate": num_effective / num_param,
+                        "hessian_norm": hessian_squared_norm,
+                        "hessian_norm2": hessian_squared_norm2,
                         "train/clip_rate": clip_time / (iter_num + 1),
                     },
                     step=iter_num,
@@ -397,13 +394,14 @@ while True:
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = get_batch("train")
             # backward pass, with gradient scaling if training in fp16
-            (loss).backward()
+            (loss).backward(create_graph=True)
         # clip the gradient
         if grad_clip != 0.0:
             total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             if total_norm.item() > grad_clip:
                 clip_time += 1
         # step the optimizer and scaler if training in fp16
+        optimizer.update_hessian()
         optimizer.step(bs=total_bs * block_size)
         # flush the gradients as soon as we can, no need for this memory anymore
         optimizer.zero_grad(set_to_none=True)
@@ -434,9 +432,8 @@ while True:
                         "lr": lr,
                         "param_norm": total_param_norm,
                         "momentum_norm": momentum_norm,
-                        "hessian_norm": hessian_norm.item(),
-                        "hessian_norm2": hessian_norm2,
-                        "train/win_rate": num_effective / num_param,
+                        "hessian_squared_norm": hessian_squared_norm.item(),
+                        "hessian_squared_norm2": hessian_squared_norm2,
                         "train/clip_rate": clip_time / (iter_num + 1),
                     },
                     step=iter_num,
@@ -444,45 +441,20 @@ while True:
         iter_num += 1
         local_iter_num += 1
 
-        for micro_step in range(gradient_accumulation_steps):
-            if ddp:
-                model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
-            with ctx:
-                logits, _ = model(X, 0)
-            X, Y = get_batch("train")
-            samp_dist = torch.distributions.Categorical(logits=logits)
-            y_sample = samp_dist.sample()
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), y_sample.view(-1), ignore_index=-1
-            )
-            # backward pass, with gradient scaling if training in fp16
-            (loss / gradient_accumulation_steps).backward()
-        # clip the gradient
-        if grad_clip != 0.0:
-            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        # step the optimizer and scaler if training in fp16
-        optimizer.update_hessian()
-        # flush the gradients as soon as we can, no need for this memory anymore
-        optimizer.zero_grad(set_to_none=True)
-
-        num_param = 0
-        num_effective = 0
-        hessian_norm = 0
-        hessian_norm2 = 0
+        hessian_squared_norm = 0
+        hessian_squared_norm2 = 0
 
         LL = len(optimizer.state_dict()["state"])
 
         for jj in range(LL):
-            num_param += optimizer.state_dict()["state"][jj]["exp_avg"].numel()
-            num_effective += torch.sum(
-                torch.abs(optimizer.state_dict()["state"][jj]["exp_avg"])
-                < rho * total_bs * block_size * optimizer.state_dict()["state"][jj]["hessian"]
+            hessian_squared_norm += (
+                optimizer.state_dict()["state"][jj]["exp_hessian_diag_sq"].detach().norm(1).item()
             )
-            hessian_norm += optimizer.state_dict()["state"][jj]["hessian"].detach().norm(1).item()
-            hessian_norm2 += (
-                optimizer.state_dict()["state"][jj]["hessian"].detach().norm(2).item() ** 2
+            hessian_squared_norm2 += (
+                optimizer.state_dict()["state"][jj]["exp_hessian_diag_sq"].detach().norm(2).item()
+                ** 2
             )
-        hessian_norm2 = hessian_norm2**0.5
+        hessian_squared_norm2 = hessian_squared_norm2**0.5
 
         t1 = time.time()
         dt = t1 - t0

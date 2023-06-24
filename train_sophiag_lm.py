@@ -51,6 +51,12 @@ rho = 0.03
 interval = 10
 hess_interval = interval
 variant = 4
+
+# Params of SophiaGLM
+damping_factor = 1.0
+damping_increment = 2.0
+damping_decrement = 3.0
+
 # learning rate decay settings
 decay_lr = True  # whether to decay the learning rate
 warmup_iters = 2000  # how many steps to warm up for
@@ -202,7 +208,15 @@ model.to(device)
 
 
 optimizer = model.configure_optimizers(
-    optimizer_name, weight_decay, learning_rate, (beta1, beta2), rho, device_type
+    optimizer_name,
+    weight_decay,
+    learning_rate,
+    (beta1, beta2),
+    rho,
+    device_type,
+    damping_factor,
+    damping_increment,
+    damping_decrement,
 )
 if init_from == "resume":
     optimizer.load_state_dict(checkpoint["optimizer"])
@@ -278,7 +292,9 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(
+            f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, damping factor {optimizer.damping_factor:.16f}"
+        )
         if wandb_log:
             wandb.log(
                 {
@@ -325,6 +341,7 @@ while True:
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = get_batch("train")
             # backward pass, with gradient scaling if training in fp16
+            optimizer.update_damping_factor(loss=loss.item())
             (loss).backward()
         # clip the gradient
         if grad_clip != 0.0:
@@ -344,11 +361,12 @@ while True:
             lossf = (
                 loss.item() * gradient_accumulation_steps
             )  # loss as float. note: this is a CPU-GPU sync point
+
             if local_iter_num >= 5:  # let the training loop settle a bit
                 mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
             print(
-                f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+                f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}% damping factor {optimizer.damping_factor:.16f}"
             )
             total_param_norm = 0
             momentum_norm = 0
@@ -378,6 +396,9 @@ while True:
                         "hessian_norm2": hessian_norm2,
                         "train/win_rate": num_effective / num_param,
                         "train/clip_rate": clip_time / (iter_num + 1),
+                        "damping_factor": optimizer.damping_factor
+                        if optimizer.damping_factor is not None
+                        else 0.0,
                     },
                     step=iter_num,
                 )
@@ -398,6 +419,7 @@ while True:
             X, Y = get_batch("train")
             # backward pass, with gradient scaling if training in fp16
             (loss).backward()
+            optimizer.update_damping_factor(loss=loss.item())
         # clip the gradient
         if grad_clip != 0.0:
             total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -405,6 +427,7 @@ while True:
                 clip_time += 1
         # step the optimizer and scaler if training in fp16
         optimizer.step(bs=total_bs * block_size)
+
         # flush the gradients as soon as we can, no need for this memory anymore
         optimizer.zero_grad(set_to_none=True)
 
@@ -420,7 +443,7 @@ while True:
                 mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
             print(
-                f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+                f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, damping factor {optimizer.damping_factor:.16f}"
             )
 
             total_param_norm = 0
@@ -438,6 +461,9 @@ while True:
                         "hessian_norm2": hessian_norm2,
                         "train/win_rate": num_effective / num_param,
                         "train/clip_rate": clip_time / (iter_num + 1),
+                        "damping_factor": optimizer.damping_factor
+                        if optimizer.damping_factor is not None
+                        else 0.0,
                     },
                     step=iter_num,
                 )
