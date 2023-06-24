@@ -1,6 +1,7 @@
 import math
 import inspect
 from dataclasses import dataclass
+from levenberg_marquardt import LevenbergMarquardt
 from sophia import SophiaG, SophiaH
 
 import torch
@@ -14,6 +15,7 @@ optimizer_dict = {
     "sophiag": SophiaG,
     "sophiah": SophiaH,
     "sophiaglm": SophiaGLM,
+    "levenbergmarquardt": LevenbergMarquardt,
 }
 
 
@@ -390,6 +392,16 @@ class GPT(nn.Module):
             optimizer = opt_func(optim_groups, lr=learning_rate, betas=betas, rho=rho)
         elif optimizer_name == "sophiah":
             optimizer = opt_func(optim_groups, lr=learning_rate, betas=betas, rho=rho)
+        elif optimizer_name == "levenbergmarquardt":
+            optimizer = opt_func(
+                optim_groups,
+                lr=learning_rate,
+                betas=betas,
+                rho=rho,
+                damping_factor=damping_factor,
+                damping_increment=damping_increment,
+                damping_decrement=damping_decrement,
+            )
         elif optimizer_name == "sophiaglm":
             optimizer = opt_func(
                 optim_groups,
