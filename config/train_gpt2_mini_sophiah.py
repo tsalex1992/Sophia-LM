@@ -1,6 +1,6 @@
 wandb_log = True
 wandb_project = "sophia"
-wandb_run_name = "gpt2-mini-sophiah-100k"
+wandb_run_name = "gpt2-mini-sophiah-10k"
 
 # 8 batch size * 512 block size * 6 gradaccum * 1 GPUs = 24576
 batch_size = 8
@@ -39,4 +39,4 @@ interval = 10
 
 compile = False
 
-out_dir = "out_mini_sophiah_100k"
+out_dir = "out_mini_sophiah_10k"
